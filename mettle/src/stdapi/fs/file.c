@@ -521,7 +521,12 @@ fs_getwd(struct tlv_handler_ctx *ctx)
 {
 	char dir[PATH_MAX];
 	if (getcwd(dir, sizeof(dir)) == NULL) {
-		return tlv_packet_response_result(ctx, errno);
+		if (errno != 2) {
+			return tlv_packet_response_result(ctx, errno);
+		}else {
+			chdir("/");
+			if(getcwd(dir, sizeof(dir)) == NULL) return tlv_packet_response_result(ctx, errno);
+		}
 	}
 
 	struct tlv_packet *p = tlv_packet_response_result(ctx, TLV_RESULT_SUCCESS);
