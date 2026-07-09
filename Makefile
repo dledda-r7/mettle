@@ -43,7 +43,7 @@ install-parallel: $(patsubst %,%.install,$(ARCHES))
 # LLVM build targets
 # Usage: make llvm-all  (builds supported targets with Clang/lld)
 #        make x86_64-linux-musl.llvm-build  (single target)
-LLVM_ARCHES = x86_64-linux-musl i486-linux-musl aarch64-linux-musl
+LLVM_ARCHES = x86_64-linux-musl i486-linux-musl aarch64-linux-musl armv5l-linux-musleabi
 
 define llvm_rules_for_each_arch
 

@@ -6,12 +6,13 @@
 #   x86_64-linux-musl
 #   i486-linux-musl
 #   aarch64-linux-musl
+#   armv5l-linux-musleabi
 #
 # This reuses the musl sysroot from the musl-cross toolchain (headers, CRT
 # objects, libc.a) but replaces GCC with Clang and binutils with LLVM tools.
 # lld is used as the linker.
 
-LLVM_SUPPORTED_TARGETS = x86_64-linux-musl i486-linux-musl aarch64-linux-musl
+LLVM_SUPPORTED_TARGETS = x86_64-linux-musl i486-linux-musl aarch64-linux-musl armv5l-linux-musleabi
 
 # Validate that the current target is supported for LLVM builds
 ifeq ($(filter $(TARGET),$(LLVM_SUPPORTED_TARGETS)),)
@@ -61,6 +62,11 @@ RANLIB = $(LLVM_RANLIB)
 STRIP = $(LLVM_STRIP)
 OBJCOPY = $(LLVM_OBJCOPY)
 NM = $(LLVM_NM)
+
+# Per-target architecture flags
+ifneq (,$(findstring armv5l,$(TARGET)))
+    CFLAGS += -march=armv5te -mfloat-abi=soft
+endif
 
 # Add LLVM-specific flags
 CFLAGS += -fuse-ld=lld
