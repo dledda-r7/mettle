@@ -34,6 +34,11 @@ ifneq (,$(findstring darwin,$(TARGET)))
 endif
 
 ifneq "$(TARGET)" "native"
+  ifeq ($(USE_LLVM),1)
+    ifneq (,$(findstring musl,$(TARGET)))
+        include make/Makefile.llvm
+    endif
+  else
     ifneq (,$(findstring musl,$(TARGET)))
         CC=$(TOOLS)/musl-cross/bin/$(TARGET)-gcc
         CXX=$(TOOLS)/musl-cross/bin/$(TARGET)-g++
@@ -42,6 +47,7 @@ ifneq "$(TARGET)" "native"
         LD=$(TOOLS)/musl-cross/bin/$(TARGET)-ld
         RANLIB=$(TOOLS)/musl-cross/bin/$(TARGET)-ranlib
     endif
+  endif
     ifneq (,$(findstring mingw,$(TARGET)))
         CC=$(TARGET)-gcc
         CXX=$(TARGET)-g++
@@ -84,6 +90,9 @@ endif
 
 ifneq (,$(findstring musl,$(TARGET)))
     TOOLS_DEPS:=$(TOOLS_DEPS) $(TOOLS)/musl-cross/.unpacked elf2bin
+  ifeq ($(USE_LLVM),1)
+    TOOLS_DEPS:=$(TOOLS_DEPS) check-llvm-tools
+  endif
 endif
 
 ifeq "$(shell uname -s)" "Darwin"
@@ -245,3 +254,13 @@ $(TOOLS)/musl-cross/.unpacked: musl-cross-$(BUILD_HOST)-$(TOOLCHAIN_VERSION).tar
 	@touch $(TOOLS)/musl-cross/.unpacked
 
 $(TOOLS): $(TOOLS_DEPS)
+
+# LLVM toolchain validation (used when USE_LLVM=1)
+.PHONY: check-llvm-tools
+check-llvm-tools:
+	@command -v clang >/dev/null 2>&1 || command -v clang-21 >/dev/null 2>&1 || \
+		(echo "Error: clang not found. Install with: apt install clang" && exit 1)
+	@command -v ld.lld >/dev/null 2>&1 || command -v ld.lld-21 >/dev/null 2>&1 || \
+		(echo "Error: ld.lld not found. Install with: apt install lld" && exit 1)
+	@command -v llvm-ar >/dev/null 2>&1 || command -v llvm-ar-21 >/dev/null 2>&1 || \
+		(echo "Error: llvm-ar not found. Install with: apt install llvm" && exit 1)

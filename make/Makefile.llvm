@@ -1,0 +1,91 @@
+# LLVM/Clang cross-compilation toolchain
+#
+# Usage: make TARGET=x86_64-linux-musl USE_LLVM=1
+#
+# Supported targets:
+#   x86_64-linux-musl
+#   i486-linux-musl
+#   aarch64-linux-musl
+#
+# This reuses the musl sysroot from the musl-cross toolchain (headers, CRT
+# objects, libc.a) but replaces GCC with Clang and binutils with LLVM tools.
+# lld is used as the linker.
+
+LLVM_SUPPORTED_TARGETS = x86_64-linux-musl i486-linux-musl aarch64-linux-musl
+
+# Validate that the current target is supported for LLVM builds
+ifeq ($(filter $(TARGET),$(LLVM_SUPPORTED_TARGETS)),)
+    $(error LLVM build not supported for target '$(TARGET)'. Supported: $(LLVM_SUPPORTED_TARGETS))
+endif
+
+# Detect LLVM tools - prefer unversioned, fall back to highest versioned
+LLVM_CC := $(shell command -v clang 2>/dev/null || command -v clang-21 2>/dev/null || command -v clang-18 2>/dev/null || command -v clang-17 2>/dev/null)
+LLVM_CXX := $(shell command -v clang++ 2>/dev/null || command -v clang++-21 2>/dev/null || command -v clang++-18 2>/dev/null || command -v clang++-17 2>/dev/null)
+LLVM_AR := $(shell command -v llvm-ar 2>/dev/null || command -v llvm-ar-21 2>/dev/null || command -v llvm-ar-18 2>/dev/null || command -v llvm-ar-17 2>/dev/null)
+LLVM_RANLIB := $(shell command -v llvm-ranlib 2>/dev/null || command -v llvm-ranlib-21 2>/dev/null || command -v llvm-ranlib-18 2>/dev/null || command -v llvm-ranlib-17 2>/dev/null)
+LLVM_STRIP := $(shell command -v llvm-strip 2>/dev/null || command -v llvm-strip-21 2>/dev/null || command -v llvm-strip-18 2>/dev/null || command -v llvm-strip-17 2>/dev/null)
+LLVM_OBJCOPY := $(shell command -v llvm-objcopy 2>/dev/null || command -v llvm-objcopy-21 2>/dev/null || command -v llvm-objcopy-18 2>/dev/null || command -v llvm-objcopy-17 2>/dev/null)
+LLVM_NM := $(shell command -v llvm-nm 2>/dev/null || command -v llvm-nm-21 2>/dev/null || command -v llvm-nm-18 2>/dev/null || command -v llvm-nm-17 2>/dev/null)
+LLVM_LLD := $(shell command -v ld.lld 2>/dev/null || command -v ld.lld-21 2>/dev/null || command -v ld.lld-18 2>/dev/null || command -v ld.lld-17 2>/dev/null)
+
+ifeq ($(LLVM_CC),)
+    $(error clang not found. Install LLVM/Clang (e.g., apt install clang lld))
+endif
+ifeq ($(LLVM_LLD),)
+    $(error ld.lld not found. Install lld (e.g., apt install lld))
+endif
+
+# Map our target triples to Clang target triples
+# i486-linux-musl needs special handling since Clang uses i386/i686
+LLVM_TARGET_TRIPLE = $(TARGET)
+ifeq ($(TARGET),i486-linux-musl)
+    LLVM_TARGET_TRIPLE = i486-linux-musl
+endif
+
+# Sysroot: reuse the musl-cross per-target sysroot
+LLVM_SYSROOT = $(TOOLS)/musl-cross/$(TARGET)
+
+# libgcc.a path for compiler builtins (from musl-cross GCC)
+LLVM_LIBGCC_DIR = $(shell find $(TOOLS)/musl-cross/lib/gcc/$(TARGET) -name 'libgcc.a' -printf '%h\n' 2>/dev/null | head -1)
+
+# GCC toolchain prefix (for crtbeginS.o, crtendS.o, libgcc.a)
+LLVM_GCC_TOOLCHAIN = $(TOOLS)/musl-cross
+
+# Set compiler and linker variables
+CC = $(LLVM_CC) --target=$(LLVM_TARGET_TRIPLE) --sysroot=$(LLVM_SYSROOT) --gcc-toolchain=$(LLVM_GCC_TOOLCHAIN)
+CXX = $(LLVM_CXX) --target=$(LLVM_TARGET_TRIPLE) --sysroot=$(LLVM_SYSROOT) --gcc-toolchain=$(LLVM_GCC_TOOLCHAIN)
+CPP = $(LLVM_CC) --target=$(LLVM_TARGET_TRIPLE) --sysroot=$(LLVM_SYSROOT) --gcc-toolchain=$(LLVM_GCC_TOOLCHAIN) -E
+AR = $(LLVM_AR)
+LD = $(LLVM_LLD)
+RANLIB = $(LLVM_RANLIB)
+STRIP = $(LLVM_STRIP)
+OBJCOPY = $(LLVM_OBJCOPY)
+NM = $(LLVM_NM)
+
+# Add LLVM-specific flags
+CFLAGS += -fuse-ld=lld
+LDFLAGS += -fuse-ld=lld
+
+# Suppress Clang-specific warnings that fire in older dependency libraries
+# (json-c, libsigar, etc. add their own -Werror which we cannot control)
+CFLAGS += -Wno-error=implicit-const-int-float-conversion
+CFLAGS += -Wno-error=unused-but-set-variable
+CFLAGS += -Wno-error=single-bit-bitfield-constant-conversion
+
+# Modern Clang (16+) treats implicit function declarations as errors, which
+# breaks many autoconf probes (they call functions without proper #includes).
+CFLAGS += -Wno-error=implicit-function-declaration
+CFLAGS += -Wno-error=incompatible-function-pointer-types
+
+# Use libgcc for builtins if available (from musl-cross), otherwise compiler-rt
+ifneq ($(LLVM_LIBGCC_DIR),)
+    LDFLAGS += -L$(LLVM_LIBGCC_DIR)
+    CFLAGS += --rtlib=libgcc
+    LDFLAGS += --rtlib=libgcc
+else
+    CFLAGS += --rtlib=compiler-rt
+    LDFLAGS += --rtlib=compiler-rt
+endif
+
+# Suppress warnings that differ between GCC and Clang for dependency libraries
+CFLAGS += -Wno-unused-command-line-argument
