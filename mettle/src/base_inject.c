@@ -1,407 +1,322 @@
 #include "base_inject.h"
+#include "log.h"
 
-int is_root()
-{
-	return getuid() == 0;
-}
+#if defined(__linux__) && (defined(__x86_64__) || defined(__i386__))
 
-int get_yama_ptrace_scope()
-{
-	char * ptrace_scope_path = "/proc/sys/kernel/yama/ptrace_scope";
-	char ptrace_scope_value = 0;
-	FILE * ptrace_scope_handler = fopen(ptrace_scope_path, "r");
+#include <errno.h>
+#include <signal.h>
+#include <stdint.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/ptrace.h>
+#include <sys/user.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
-	if(ptrace_scope_handler == NULL)
-	{
-		return -1;
-	}
+#define MIGRATE_STACK_SIZE 0x100000
 
-	fscanf(ptrace_scope_handler, "%c", &ptrace_scope_value);
-	fclose(ptrace_scope_handler);
+#if defined(__x86_64__)
+#define DO_SYSCALL "\x0f\x05\xcc"
+#else
+#define DO_SYSCALL "\xcd\x80\xcc"
+#endif
 
-	return ptrace_scope_value - '0';
-}
-
-int migrate_support()
-{
-	char yama_scope = get_yama_ptrace_scope();
-	
-	if(yama_scope == 0)
-	{
-		return 1;
-	}
-
-	if(yama_scope == 1 || yama_scope == 2)
-	{
-		if(is_root())
-			return 1;
-		else
-			return 0;
-	}
-	
-	return 0;
-}
-
-char *get_permissions_from_line(char *line) {
-      
-   int first_space = -1;
-      int second_space = -1;
-      for (size_t i = 0; i < strlen(line); i++) {
-          if (line[i] == ' ' && first_space == -1) {
-              first_space = i + 1;
-          }
-          else if (line[i] == ' ' && first_space != -1) {
-              second_space = i;
-              break;
-          }
-      }
-
-      if (first_space != -1 && second_space != -1 && second_space > first_space) {
-          char *permissions = malloc(second_space - first_space + 1);
-          if (permissions == NULL) {
-              return NULL;
-          }
-          for (size_t i = first_space, j = 0; i < (size_t)second_space; i++, j++) {
-              permissions[j] = line[i];
-          }
-          permissions[second_space - first_space] = '\0';
-          return permissions;
-      }
-      return NULL;
-
-  }
-
-
-long get_end_address_from_maps_line(char *line) {
-
-      char *start_address = strchr(line, '-') + 1;
-      char *address_line = malloc(SIZE_OF_ADDRESS + 1);
-      memset(address_line, 0, SIZE_OF_ADDRESS + 1);
-      memcpy(address_line, start_address, SIZE_OF_ADDRESS);
-      long address = strtol(address_line, (char **) NULL, 16);
-      free(address_line);
-      return address;
-}
-
-
-long get_start_address_from_maps_line(char *line) {
-
-      char *address_line = malloc(SIZE_OF_ADDRESS + 1);
-      memset(address_line, 0, SIZE_OF_ADDRESS + 1);
-      memcpy(address_line, line, SIZE_OF_ADDRESS);
-      long address = strtol(address_line, (char **) NULL, 16);
-      free(address_line);
-      return address;
-}
-
-
-void get_process_writable_sections(int pid, writable_section_ptr process_sections)
-{
-
-  FILE * maps_handler;
-  char * line = NULL;
-  size_t len = 0;
-  int section_count = 0;
-  char pid_str[5]; 
-  char maps_file_path[8192];
-
-  SIGAR_PROC_FILENAME(maps_file_path, pid, "/maps");	
-
-  maps_handler = fopen(maps_file_path, "r");
-  
-  char * permissions;
-  long start_address;
-  long end_address;
-
-  process_sections->pid = pid;
-
-  while(getline(&line,&len, maps_handler) != -1)
-  {
-    permissions = get_permissions_from_line(line);
-
-    char * permission = permissions;
-    while(*permission != 0)
-    {
-      char permission_char = *permission;
-      if(permission_char == 0x78)
-        break;
-      permission++;
-    }
-    
-    if(*permission == 0)
-    {
-      free(permissions);
-      continue;
-    }
-
-    free(permissions);
-
-    start_address = get_start_address_from_maps_line(line);
-    end_address = get_end_address_from_maps_line(line);
-
-    process_sections->sections[section_count].start_address = start_address;
-    process_sections->sections[section_count++].end_address = end_address;
-
-    if(section_count >= 255)
-      break;
-    
-  }
-  
-  fclose(maps_handler);
-
-}
-
-
-unsigned long find_codecave(int pid, int cave_size, writable_section_ptr process_sections)
-{
-	char * mem_data = NULL;
-	FILE * mem_handler = NULL;
-	int current_cave_size = 0;
-  	char mem_file_path[8192];
-
-	if(process_sections->pid == 0)
-	{
-		get_process_writable_sections(pid, process_sections);
-	}
-	
-  	SIGAR_PROC_FILENAME(mem_file_path, pid, "/mem");	
-	
-	mem_handler = fopen(mem_file_path, "r");
-	
-	for(int i = 0; i < 255; i++)
-	{
-		long section_start = process_sections->sections[i].start_address;
-		long section_end = process_sections->sections[i].end_address;
-		
-		fseek(mem_handler, section_start, SEEK_SET);
-
-		long section_size = section_end - section_start;
-
-		mem_data = malloc(sizeof(char)*(int)(section_end-section_start));
-  
-		fread(mem_data,sizeof(char), (int)(section_end-section_start), mem_handler);
-		
-		current_cave_size = 0;
-		
-		for(char * mem_byte = mem_data; mem_byte < mem_data + (section_end-section_start); mem_byte++)
-		{
-
-			if(*mem_byte != 0x00)
-			 {
-			   current_cave_size = 0;
-			   continue;
-			 }
-			 if(current_cave_size == cave_size)
-			 {
-
-			   free(mem_data);
-			   fclose(mem_handler);
-			   return section_start + ((unsigned long)mem_byte - (unsigned long)mem_data) - cave_size;
-			 }
-
-			 current_cave_size++;
-		}
-
-		free(mem_data);
-	}
-
-	fclose(mem_handler);
-	return 0;
-}
-
-int remote_write(int pid, long address, char * data, size_t data_length)
-{
-	int status 	= 0;
-
-	kill(pid, SIGSTOP);
-
-	waitpid(pid, NULL, 0);
-
-	for(size_t i = 0; i < data_length; i+=sizeof(long))
-	{
-		long data_chunk = 0;
-		memcpy(&data_chunk, data + i, sizeof(long));
-		if( ptrace(PTRACE_POKETEXT, pid, address + i, data_chunk) != 0)
-		{
-			kill(pid, SIGCONT);
-			waitpid(pid, NULL, 0);
-			return 0;
-		}
-	}
-
-	ptrace(PTRACE_CONT, pid, NULL, NULL);
-	
-	return 1;
-}
-
-
-
-int remote_mmap(int pid, long mmap_stub, long length, long prot, long flags, long fd, long offset, long * mmaped_address)
+static int wait_for_stop(int pid)
 {
 	int status;
-	struct user_regs_struct saved_regs = { 0 };
-	struct user_regs_struct regs = { 0 };
-	
-	kill(pid, SIGSTOP);
 
-	waitpid(pid, NULL, 0);
-
-	ptrace(PTRACE_GETREGS, pid, NULL, &saved_regs);
-
-#if defined(__x86_64__)
-	regs.rip 	= mmap_stub;
-	regs.rax	= 9;
-	regs.rdi 	= 0;
-	regs.rsi 	= length;
-	regs.rdx 	= prot;
-	regs.r10 	= flags;
-	regs.r8 	= fd;
-	regs.rsp	= saved_regs.rsp+0x100;
-	regs.rbp	= saved_regs.rbp;
-#elif defined(__i386__)
-	regs.eip  = mmap_stub;
-	regs.eax  = 192;                   // sys_mmap2
-	regs.ebx  = 0;                     // addr (NULL)
-	regs.ecx  = length;
-	regs.edx  = prot;
-	regs.esi  = flags;
-	regs.edi  = fd;
-	regs.ebp  = offset / 4096;         // mmap2 offset is in 4096-byte pages
-	regs.esp  = saved_regs.esp + 0x100;
-#endif
-
-	ptrace(PTRACE_SETREGS, pid, NULL, &regs);
-
-	ptrace(PTRACE_CONT, pid, NULL, NULL);
-
-	wait(&status);
-
-	if(WIFSTOPPED(status) && WSTOPSIG(status) == 5)
-	{
-		ptrace(PTRACE_GETREGS, pid, NULL, &regs);
-#if defined(__x86_64__)
-		*mmaped_address = regs.rax;
-#elif defined(__i386__)
-		*mmaped_address = regs.eax;
-#endif
-
-		ptrace(PTRACE_SETREGS, pid, NULL, &saved_regs);
-		ptrace(PTRACE_CONT, pid, NULL, NULL);
-		return 1;
+	if (waitpid(pid, &status, 0) != pid) {
+		return 0;
 	}
 
-	return 0;
+	return WIFSTOPPED(status);
 }
 
-long remote_allocate(int pid, size_t size, writable_section_ptr process_sections) 
+static int wait_for_trap(int pid)
 {
-	long codecave_address 	= 0;
-	long mmaped_address	= 0;
-	
-	codecave_address = find_codecave(pid, sizeof(DO_SYSCALL), process_sections);
+	int status;
 
-	if(codecave_address == 0)
-		return 0;
-
-	if(remote_write(pid, codecave_address, DO_SYSCALL, sizeof(DO_SYSCALL)) == 0)
-		return 0;
-
-	if(remote_mmap(pid, codecave_address, size, 0x6, 0x22, -1, 0, &mmaped_address) == 0)
-		return 0;
-
-	return mmaped_address;
-
+	for (;;) {
+		if (waitpid(pid, &status, 0) != pid || !WIFSTOPPED(status)) {
+			return 0;
+		}
+		if (WSTOPSIG(status) == SIGTRAP) {
+			return 1;
+		}
+		if (ptrace(PTRACE_CONT, pid, NULL,
+				(void *)(long)(WSTOPSIG(status) == SIGCHLD ? 0 : WSTOPSIG(status))) != 0) {
+			return 0;
+		}
+	}
 }
 
-int remote_call_payload(int pid, long payload_address, long stub_address, int fd)
+static int read_word(int pid, unsigned long address, long *word)
 {
-	int status = 0;			
-	struct user_regs_struct saved_regs = { 0 };
-	struct user_regs_struct regs = { 0 };
-	
-	kill(pid, SIGSTOP);
-	waitpid(pid, NULL, 0);
-	
-	if(ptrace(PTRACE_GETREGS, pid, NULL, &saved_regs) != 0)
-	{
-		ptrace(PTRACE_CONT, pid, NULL, NULL);
-		return 0;
-	}
-
-
-#if defined(__x86_64__)
-	regs.rip 	= stub_address;
-	regs.rsp	= saved_regs.rsp+0x100;
-	regs.rbp	= saved_regs.rbp;
-	regs.rax	= payload_address;
-	regs.rbx	= getpid();
-	regs.rcx	= fd;
-#elif defined(__i386__)
-	regs.eip  = stub_address;
-	regs.esp  = saved_regs.esp + 0x100;
-	regs.ebp  = saved_regs.ebp;
-	regs.eax  = payload_address;       // payload mmap base
-	regs.ebx  = getpid();              // current pid (for pidfd_open in child)
-	regs.ecx  = fd;                    // socket fd (for pidfd_getfd in child)
-#endif
-
-	ptrace(PTRACE_SETREGS, pid, NULL, &regs);
-
-	ptrace(PTRACE_CONT, pid, NULL, NULL);
-
-	wait(&status);
-
-	if(WIFSTOPPED(status) && WSTOPSIG(status) == 5)
-	{
-		ptrace(PTRACE_SETREGS, pid, NULL, &saved_regs);
-		ptrace(PTRACE_CONT, pid, NULL, NULL);
-		return 1;
-	}
-
-	return 0;
+	errno = 0;
+	*word = ptrace(PTRACE_PEEKDATA, pid, (void *)address, NULL);
+	return errno == 0;
 }
 
-int migrate(int pid, char * migrate_stub, size_t migrate_stub_length, char * payload, size_t payload_length, const char * uuid, int fd)
+static int write_word(int pid, unsigned long address, long word)
 {
-	struct user_regs_struct regs;
-	long payload_address = 0;
-	long migrate_stub_address = 0;
+	return ptrace(PTRACE_POKEDATA, pid, (void *)address, (void *)word) == 0;
+}
 
-	writable_section_t process_sections = { 0 };
+static int remote_write(int pid, unsigned long address, const void *data,
+	size_t data_length)
+{
+	const unsigned char *cursor = data;
 
-	ptrace(PTRACE_ATTACH, pid, NULL, NULL);
-	waitpid(pid, NULL, 0);
-	
-	ptrace(PTRACE_CONT, pid, NULL, NULL);
+	for (size_t offset = 0; offset < data_length; offset += sizeof(long)) {
+		long word;
+		size_t remaining = data_length - offset;
+		size_t copy_length = remaining < sizeof(word) ? remaining : sizeof(word);
 
-	payload_address 	= remote_allocate(pid, payload_length, &process_sections);
-	migrate_stub_address 	= remote_allocate(pid, migrate_stub_length, &process_sections);
-
-	if(payload_address == 0 || migrate_stub_address == 0)
-	{
-		ptrace(PTRACE_DETACH, pid, NULL, NULL);
-		return 0;
-	}
-
-	if(remote_write(pid, payload_address, payload, payload_length) == 0 || remote_write(pid, migrate_stub_address, migrate_stub, migrate_stub_length) == 0)
-	{
-		ptrace(PTRACE_DETACH, pid, NULL, NULL);
-		return 0;
-	}
-
-	
-	if( remote_call_payload(pid, payload_address, migrate_stub_address,fd) == 0)
-	{
-		ptrace(PTRACE_DETACH, pid, NULL, NULL);
-		return 0;
-	}
-	
-	kill(pid, SIGSTOP);
-	waitpid(pid, NULL, 0);
-    	if(ptrace(PTRACE_DETACH, pid, NULL, NULL) != 0)
-	{
-		return 0;
+		if (!read_word(pid, address + offset, &word)) {
+			return 0;
+		}
+		memcpy(&word, cursor + offset, copy_length);
+		if (!write_word(pid, address + offset, word)) {
+			return 0;
+		}
 	}
 
 	return 1;
 }
+
+static int remote_syscall(int pid, struct user_regs_struct *saved_regs,
+	struct user_regs_struct *regs, long *result)
+{
+	long original_word;
+	long patched_word;
+	unsigned long instruction_pointer;
+	int ok = 0;
+
+#if defined(__x86_64__)
+	instruction_pointer = saved_regs->rip;
+	regs->rip = instruction_pointer;
+	regs->orig_rax = -1;
+#else
+	instruction_pointer = saved_regs->eip;
+	regs->eip = instruction_pointer;
+	regs->orig_eax = -1;
+#endif
+
+	if (!read_word(pid, instruction_pointer, &original_word)) {
+		return 0;
+	}
+	patched_word = original_word;
+	memcpy(&patched_word, DO_SYSCALL, sizeof(DO_SYSCALL) - 1);
+	if (!write_word(pid, instruction_pointer, patched_word)) {
+		return 0;
+	}
+
+	if (ptrace(PTRACE_SETREGS, pid, NULL, regs) != 0) {
+		goto cleanup;
+	}
+	if (ptrace(PTRACE_CONT, pid, NULL, NULL) != 0 || !wait_for_trap(pid)) {
+		goto cleanup;
+	}
+	if (ptrace(PTRACE_GETREGS, pid, NULL, regs) != 0) {
+		goto cleanup;
+	}
+
+#if defined(__x86_64__)
+	*result = (long)regs->rax;
+#else
+	*result = (int32_t)regs->eax;
+#endif
+	ok = 1;
+
+cleanup:
+	if (!write_word(pid, instruction_pointer, original_word)) {
+		ok = 0;
+	}
+	if (ptrace(PTRACE_SETREGS, pid, NULL, saved_regs) != 0) {
+		ok = 0;
+	}
+	return ok;
+}
+
+static int syscall_failed(long result)
+{
+	return result < 0 && result >= -4095;
+}
+
+static unsigned long remote_map(int pid, struct user_regs_struct *saved_regs,
+	size_t length, int protection, int flags)
+{
+	struct user_regs_struct regs = *saved_regs;
+	long result;
+
+#if defined(__x86_64__)
+	regs.rax = 9;
+	regs.rdi = 0;
+	regs.rsi = length;
+	regs.rdx = protection;
+	regs.r10 = flags;
+	regs.r8 = -1;
+	regs.r9 = 0;
+#else
+	regs.eax = 192;
+	regs.ebx = 0;
+	regs.ecx = length;
+	regs.edx = protection;
+	regs.esi = flags;
+	regs.edi = -1;
+	regs.ebp = 0;
+#endif
+
+	if (!remote_syscall(pid, saved_regs, &regs, &result) || syscall_failed(result)) {
+		return 0;
+	}
+	return (unsigned long)result;
+}
+
+static int remote_unmap(int pid, struct user_regs_struct *saved_regs,
+	unsigned long address, size_t length)
+{
+	struct user_regs_struct regs = *saved_regs;
+	long result;
+
+#if defined(__x86_64__)
+	regs.rax = 11;
+	regs.rdi = address;
+	regs.rsi = length;
+#else
+	regs.eax = 91;
+	regs.ebx = address;
+	regs.ecx = length;
+#endif
+
+	return remote_syscall(pid, saved_regs, &regs, &result) && !syscall_failed(result);
+}
+
+static int remote_call(int pid, struct user_regs_struct *saved_regs,
+	unsigned long payload_address, unsigned long stub_address,
+	unsigned long stack_address, unsigned long ack_address, int fd)
+{
+	struct user_regs_struct regs = *saved_regs;
+	long result;
+
+#if defined(__x86_64__)
+	regs.rip = stub_address;
+	regs.orig_rax = -1;
+	regs.rsp = stack_address + MIGRATE_STACK_SIZE - 0x200;
+	regs.rax = payload_address;
+	regs.rbx = getpid();
+	regs.rcx = fd;
+	regs.rdx = ack_address;
+#else
+	regs.eip = stub_address;
+	regs.orig_eax = -1;
+	regs.esp = stack_address + MIGRATE_STACK_SIZE - 0x200;
+	regs.eax = payload_address;
+	regs.ebx = getpid();
+	regs.ecx = fd;
+	regs.edx = ack_address;
+#endif
+
+	if (ptrace(PTRACE_SETREGS, pid, NULL, &regs) != 0 ||
+		ptrace(PTRACE_CONT, pid, NULL, NULL) != 0 ||
+		!wait_for_trap(pid) ||
+		ptrace(PTRACE_GETREGS, pid, NULL, &regs) != 0) {
+		return 0;
+	}
+
+#if defined(__x86_64__)
+	result = (long)regs.rax;
+#else
+	result = (int32_t)regs.eax;
+#endif
+	if (result != 1) {
+		log_error("Migrated child did not become ready (status %ld)", result);
+	}
+
+	return ptrace(PTRACE_SETREGS, pid, NULL, saved_regs) == 0 && result == 1;
+}
+
+int migrate_support(void)
+{
+	return 1;
+}
+
+int migrate(int pid, char *migrate_stub, size_t migrate_stub_length,
+	char *payload, size_t payload_length, const char *uuid, int fd)
+{
+	struct user_regs_struct saved_regs;
+	unsigned long payload_address = 0;
+	unsigned long stub_address = 0;
+	unsigned long stack_address = 0;
+	unsigned long ack_address = 0;
+	int attached = 0;
+	int success = 0;
+
+	(void)uuid;
+	if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) != 0 || !wait_for_stop(pid)) {
+		return 0;
+	}
+	attached = 1;
+	if (ptrace(PTRACE_GETREGS, pid, NULL, &saved_regs) != 0) {
+		goto cleanup;
+	}
+
+	payload_address = remote_map(pid, &saved_regs, payload_length,
+		PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS);
+	stub_address = remote_map(pid, &saved_regs, migrate_stub_length,
+		PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS);
+	stack_address = remote_map(pid, &saved_regs, MIGRATE_STACK_SIZE,
+		PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+	ack_address = remote_map(pid, &saved_regs, sizeof(uint32_t),
+		PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS);
+	if (!payload_address || !stub_address || !stack_address || !ack_address) {
+		goto cleanup;
+	}
+	if (!remote_write(pid, payload_address, payload, payload_length) ||
+		!remote_write(pid, stub_address, migrate_stub, migrate_stub_length)) {
+		goto cleanup;
+	}
+
+	success = remote_call(pid, &saved_regs, payload_address, stub_address,
+		stack_address, ack_address, fd);
+
+cleanup:
+	if (attached) {
+		if (payload_address) {
+			remote_unmap(pid, &saved_regs, payload_address, payload_length);
+		}
+		if (stub_address) {
+			remote_unmap(pid, &saved_regs, stub_address, migrate_stub_length);
+		}
+		if (stack_address) {
+			remote_unmap(pid, &saved_regs, stack_address, MIGRATE_STACK_SIZE);
+		}
+		if (ack_address) {
+			remote_unmap(pid, &saved_regs, ack_address, sizeof(uint32_t));
+		}
+		ptrace(PTRACE_DETACH, pid, NULL, NULL);
+	}
+	return success;
+}
+
+#else
+
+int migrate_support(void)
+{
+	return 0;
+}
+
+int migrate(int pid, char *migrate_stub, size_t migrate_stub_length,
+	char *payload, size_t payload_length, const char *uuid, int fd)
+{
+	(void)pid;
+	(void)migrate_stub;
+	(void)migrate_stub_length;
+	(void)payload;
+	(void)payload_length;
+	(void)uuid;
+	(void)fd;
+	return 0;
+}
+
+#endif

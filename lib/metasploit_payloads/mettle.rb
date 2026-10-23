@@ -97,7 +97,12 @@ module MetasploitPayloads
       end
       payload = [config_bytes.length].pack('N') + config_bytes
       padded = payload + "\x00" * (CONFIG_BLOCK_MAX - payload.length)
-      bin.sub(CONFIG_BLOCK_SIG + "\x00" * (CONFIG_BLOCK_MAX - CONFIG_BLOCK_SIG.length)) { padded }
+      slot = CONFIG_BLOCK_SIG + "\x00" * (CONFIG_BLOCK_MAX - CONFIG_BLOCK_SIG.length)
+      unless bin.include?(slot)
+        raise Mettle::Error, 'mettle binary does not contain a config block slot', caller
+      end
+
+      bin.sub(slot) { padded }
     end
 
     def add_args(bin, params)

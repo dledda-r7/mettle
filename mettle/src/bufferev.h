@@ -53,6 +53,8 @@ size_t bufferev_read(struct bufferev *be, void *buf, size_t buflen);
 
 struct buffer_queue *bufferev_read_queue(struct bufferev *be);
 
+size_t bufferev_write_pending(struct bufferev *be);
+
 struct bufferev_udp_msg {
 	socklen_t src_len;
 	ssize_t buf_len;

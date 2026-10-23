@@ -103,6 +103,11 @@ int network_client_get_socket_fd(struct network_client *nc)
 	return bufferev_get_socket_fd(nc->be);
 }
 
+size_t network_client_write_pending(struct network_client *nc)
+{
+	return nc ? bufferev_write_pending(nc->be) : 0;
+}
+
 int server_init(struct network_client_server *srv, const char *uri)
 {
 	int rc = -1;

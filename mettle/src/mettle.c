@@ -36,6 +36,9 @@ struct mettle {
 	char fqdn[SIGAR_FQDN_LEN];
 	struct ev_loop *loop;
 	struct ev_timer heartbeat;
+	volatile uint32_t *migration_ack;
+	bool started;
+	bool c2_reachable;
 };
 
 static struct ev_idle eio_idle_watcher;
@@ -202,6 +205,11 @@ static void on_c2_event(struct c2 *c2, int event, void *arg)
 {
 	struct mettle *m = arg;
 	if (event & C2_REACHABLE) {
+		m->c2_reachable = true;
+		if (m->started && m->migration_ack) {
+			*m->migration_ack = 1;
+			m->migration_ack = NULL;
+		}
 	}
 }
 
@@ -310,11 +318,21 @@ int mettle_start(struct mettle *m)
 
 	tlv_register_stdapi(m);
 
+	m->started = true;
 	c2_start(m->c2);
+	if (m->c2_reachable && m->migration_ack) {
+		*m->migration_ack = 1;
+		m->migration_ack = NULL;
+	}
 
 	ev_async_start(m->loop, &eio_async_watcher);
 
 	start_heartbeat(m);
 
 	return ev_run(m->loop, 0);
+}
+
+void mettle_set_migration_ack(struct mettle *m, volatile uint32_t *migration_ack)
+{
+	m->migration_ack = migration_ack;
 }

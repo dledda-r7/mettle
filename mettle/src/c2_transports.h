@@ -10,6 +10,4 @@ void c2_register_http_transports(struct c2 *c2);
 
 void c2_register_tcp_transports(struct c2 *c2);
 
-int http_transport_egress_pending(struct c2_transport *t);
-
 #endif

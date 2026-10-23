@@ -29,6 +29,8 @@ struct c2_verb_config {
 	char *uuid_get;
 	char *uuid_header;
 	char *uuid_cookie;
+	char *user_agent;
+	char *custom_headers;
 };
 
 /*
@@ -48,6 +50,8 @@ struct c2_transport_config {
 	char *c2_uuid;
 	struct c2_verb_config *c2_get;
 	struct c2_verb_config *c2_post;
+	void *raw_tlv;
+	size_t raw_tlv_len;
 };
 
 void c2_verb_config_free(struct c2_verb_config *vc);
@@ -100,6 +104,8 @@ struct c2_transport_cbs {
 	int (*init)(struct c2_transport *t);
 	void (*start)(struct c2_transport *t);
 	void (*egress)(struct c2_transport *t, struct buffer_queue *egress);
+	int (*egress_pending)(struct c2_transport *t);
+	int (*get_socket_fd)(struct c2_transport *t);
 	void (*stop)(struct c2_transport *t);
 	void (*free)(struct c2_transport *t);
 };
@@ -116,8 +122,6 @@ struct c2_transport_config * c2_transport_get_config(struct c2_transport *t);
 
 const char * c2_transport_uri(struct c2_transport *t);
 void c2_transport_set_uri(struct c2_transport *t, const char *uri);
-const char * c2_transport_ua(struct c2_transport *t);
-const char * c2_transport_args(struct c2_transport *t);
 const char * c2_transport_dest(struct c2_transport *t);
 struct ev_loop * c2_transport_loop(struct c2_transport *loop);
 
@@ -135,5 +139,5 @@ int c2_transport_get_socket_fd(struct c2_transport *t);
 int c2_transport_egress_pending(struct c2 *c2);
 
 struct c2_transport_type * c2_get_transport_type(struct c2_transport *t);
-char * c2_get_proto(struct c2_transport *t);
+const char * c2_get_proto(struct c2_transport *t);
 #endif

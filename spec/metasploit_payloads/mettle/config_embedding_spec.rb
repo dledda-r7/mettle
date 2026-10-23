@@ -68,6 +68,14 @@ RSpec.describe MetasploitPayloads::Mettle do
         end.to raise_error(described_class::Error, 'mettle config block too large')
       end
     end
+
+    context 'when the binary does not contain the reserved slot' do
+      it 'raises an error' do
+        expect do
+          subject.send(:add_config_block, prefix + suffix, 'config')
+        end.to raise_error(described_class::Error, 'mettle binary does not contain a config block slot')
+      end
+    end
   end
 
   describe '#add_args' do

@@ -91,6 +91,11 @@ struct buffer_queue *bufferev_read_queue(struct bufferev *be)
 	return be->rx_queue;
 }
 
+size_t bufferev_write_pending(struct bufferev *be)
+{
+	return be ? buffer_queue_len(be->tx_queue) : 0;
+}
+
 void *bufferev_read_msg(struct bufferev *be, size_t *len)
 {
 	return buffer_queue_remove_msg(be->rx_queue, len);
@@ -103,7 +108,6 @@ void *bufferev_peek_msg(struct bufferev *be, size_t *len)
 
 ssize_t bufferev_write(struct bufferev *be, const void *buf, size_t buflen)
 {
-	ssize_t off = 0, rc;
 	ssize_t sent_bytes = 0;
 
 	switch (be->proto) {
@@ -111,19 +115,69 @@ ssize_t bufferev_write(struct bufferev *be, const void *buf, size_t buflen)
 		return send(be->sock, buf, buflen, 0);
 	case network_proto_tcp:
 		do {
-			rc = send(be->sock, buf + off, buflen - off, 0);
-			if (rc > 0) {
-				off += rc;
-				sent_bytes += rc;
+			sent_bytes = send(be->sock, buf, buflen, 0);
+		} while (sent_bytes < 0 && errno == EINTR);
+		if (sent_bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+			return -1;
+		}
+		if (sent_bytes < 0) {
+			sent_bytes = 0;
+		}
+		if ((size_t)sent_bytes < buflen) {
+			if (buffer_queue_add(be->tx_queue,
+					(const char *)buf + sent_bytes, buflen - sent_bytes) != 0) {
+				return sent_bytes;
 			}
-		} while (rc > 0 || (rc < 0 && (errno == EAGAIN || errno == EINTR)));
-		return sent_bytes ? sent_bytes : rc;
+			ev_io_stop(be->loop, &be->data_ev);
+			ev_io_set(&be->data_ev, be->sock, EV_READ | EV_WRITE);
+			ev_io_start(be->loop, &be->data_ev);
+		}
+		return buflen;
 
 	case network_proto_tls:
 		return buffer_queue_add(be->tx_queue, buf, buflen);
 	}
 
 	return -1;
+}
+
+static void on_write_tcp(struct bufferev *be)
+{
+	void *buf = NULL;
+	ssize_t length = buffer_queue_remove_all(be->tx_queue, &buf);
+	ssize_t sent_bytes;
+
+	if (length <= 0) {
+		return;
+	}
+	do {
+		sent_bytes = send(be->sock, buf, length, 0);
+	} while (sent_bytes < 0 && errno == EINTR);
+	if (sent_bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+		ev_io_stop(be->loop, &be->data_ev);
+		if (be->event_cb) {
+			be->event_cb(be, BEV_EOF | BEV_ERROR, be->cb_arg);
+		}
+		free(buf);
+		return;
+	}
+	if (sent_bytes < 0) {
+		sent_bytes = 0;
+	}
+	if (sent_bytes < length) {
+		buffer_queue_add(be->tx_queue, (char *)buf + sent_bytes,
+			length - sent_bytes);
+	}
+	free(buf);
+
+	if (buffer_queue_len(be->tx_queue) == 0) {
+		ev_io_stop(be->loop, &be->data_ev);
+		ev_io_set(&be->data_ev, be->sock, EV_READ);
+		ev_io_start(be->loop, &be->data_ev);
+		if (be->write_cb) {
+			be->write_cb(be, be->cb_arg);
+		}
+	}
 }
 
 static void on_read_tcp(struct bufferev *be)
@@ -191,7 +245,12 @@ on_read(struct ev_loop *loop, struct ev_io *w, int events)
 
 	switch (be->proto) {
 	case network_proto_tcp:
-		on_read_tcp(be);
+		if (events & EV_WRITE && be->sock >= 0) {
+			on_write_tcp(be);
+		}
+		if (events & EV_READ && be->sock >= 0) {
+			on_read_tcp(be);
+		}
 		break;
 	case network_proto_udp:
 		on_read_udp(be);

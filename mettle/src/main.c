@@ -328,6 +328,10 @@ static struct c2_verb_config *parse_c2_verb_group(struct tlv_packet *parent, uin
 	if (s) vc->uuid_header = strdup(s);
 	s = tlv_packet_get_str(vp, TLV_TYPE_C2_UUID_COOKIE);
 	if (s) vc->uuid_cookie = strdup(s);
+	s = tlv_packet_get_str(vp, TLV_TYPE_C2_UA);
+	if (s) vc->user_agent = strdup(s);
+	s = tlv_packet_get_str(vp, TLV_TYPE_C2_HEADERS);
+	if (s) vc->custom_headers = strdup(s);
 
 	tlv_packet_free(vp);
 	return vc;
@@ -421,6 +425,11 @@ static int parse_config_block(struct mettle *m)
 			tlv_packet_free(group);
 			continue;
 		}
+		tc->raw_tlv = malloc(group_len);
+		if (tc->raw_tlv) {
+			memcpy(tc->raw_tlv, group_data, group_len);
+			tc->raw_tlv_len = group_len;
+		}
 
 		tlv_packet_get_u32(group, TLV_TYPE_C2_COMM_TIMEOUT, &tc->comm_timeout);
 		tlv_packet_get_u32(group, TLV_TYPE_C2_RETRY_TOTAL, &tc->retry_total);
@@ -454,8 +463,11 @@ static int parse_config_block(struct mettle *m)
 		tc->c2_get = parse_c2_verb_group(group, TLV_TYPE_C2_GET);
 		tc->c2_post = parse_c2_verb_group(group, TLV_TYPE_C2_POST);
 
-		c2_add_transport_uri_config(c2, url, tc);
-		transports_added++;
+		if (c2_add_transport_uri_config(c2, url, tc) == 0) {
+			transports_added++;
+		} else {
+			c2_transport_config_free(tc);
+		}
 		tlv_packet_free(group);
 	}
 
@@ -523,6 +535,9 @@ int main(int argc, char * argv[])
 	if (m == NULL) {
 		log_error("could not initialize");
 		return 1;
+	}
+	if (argc >= 3 && argv[0] != NULL && strcmp(argv[0], "m") == 0) {
+		mettle_set_migration_ack(m, (volatile uint32_t *)((uintptr_t *)argv)[2]);
 	}
 
 	/*

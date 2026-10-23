@@ -17,17 +17,19 @@ struct tcp_ctx {
 };
 
 
-int c2_transport_get_socket_fd(struct c2_transport *t)
+static int tcp_transport_get_socket_fd(struct c2_transport *t)
 {
-
-	if (t == NULL || ( strcmp(c2_get_proto(t),"tcp") && strcmp(c2_get_proto(t),"fd") )) {
-		return -1;
-	}
 	struct tcp_ctx *ctx = (struct tcp_ctx *)c2_transport_get_ctx(t);
 	if (ctx == NULL || ctx->nc == NULL) {
 		return -1;
 	}
 	return network_client_get_socket_fd(ctx->nc);
+}
+
+static int tcp_transport_egress_pending(struct c2_transport *t)
+{
+	struct tcp_ctx *ctx = c2_transport_get_ctx(t);
+	return ctx && ctx->nc ? network_client_write_pending(ctx->nc) > 0 : 0;
 }
 
 static void tcp_read_cb(struct bufferev *be, void *arg)
@@ -82,6 +84,7 @@ int fd_transport_init(struct c2_transport *t)
 	network_client_set_cbs(ctx->nc, tcp_read_cb, NULL, tcp_event_cb, t);
 	ctx->first_packet = 1;
 	c2_transport_set_ctx(t, ctx);
+	c2_transport_reachable(t);
 	return 0;
 }
 
@@ -143,6 +146,8 @@ void c2_register_tcp_transports(struct c2 *c2)
 		.init = tcp_transport_init,
 		.start = tcp_transport_start,
 		.egress = tcp_transport_egress,
+		.egress_pending = tcp_transport_egress_pending,
+		.get_socket_fd = tcp_transport_get_socket_fd,
 		.stop = tcp_transport_stop,
 		.free = tcp_transport_free
 	};

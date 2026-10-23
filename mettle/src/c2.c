@@ -58,12 +58,6 @@ struct c2 {
 	void *cb_arg;
 };
 
-int c2_get_fd(struct c2 *c2)
-{
-	struct tcp_ctx *ctx = (struct tcp_ctx*)(c2_transport_get_ctx(c2->curr_transport));
-	return 1;
-}
-
 int
 c2_register_transport_type(struct c2 *c2, const char *proto,
 		struct c2_transport_cbs *cbs)
@@ -123,11 +117,13 @@ c2_remove_transports(struct c2 *c2)
 	return 0;
 }
 
-struct c2_transport* c2_get_next_transport(struct c2_transport *t){
-	return t->next;
+struct c2_transport* c2_get_next_transport(struct c2_transport *t)
+{
+	return t ? t->next : NULL;
 }
 
-int c2_add_transport_uri(struct c2 *c2, const char *uri)
+static int c2_add_transport(struct c2 *c2, const char *uri,
+		struct c2_transport_config *config)
 {
 	struct c2_transport *t = NULL;
 	struct c2_transport_type *type = c2_find_transport_type(c2, uri);
@@ -141,6 +137,7 @@ int c2_add_transport_uri(struct c2 *c2, const char *uri)
 	}
 	t->c2 = c2;
 	t->type = type;
+	t->config = config;
 	t->uri = strdup(uri);
 	if (t->uri == NULL) {
 		goto err;
@@ -156,7 +153,9 @@ int c2_add_transport_uri(struct c2 *c2, const char *uri)
 	t->dest += 3;
 
 	if (t->type->cbs.init) {
-		t->type->cbs.init(t);
+		if (t->type->cbs.init(t) != 0) {
+			goto err;
+		}
 	}
 
 	CDL_APPEND(c2->transports, t);
@@ -164,10 +163,18 @@ int c2_add_transport_uri(struct c2 *c2, const char *uri)
 	return 0;
 err:
 	if (t) {
+		if (t->ctx && t->type->cbs.free) {
+			t->type->cbs.free(t);
+		}
 		free(t->uri);
 		free(t);
 	}
 	return -1;
+}
+
+int c2_add_transport_uri(struct c2 *c2, const char *uri)
+{
+	return c2_add_transport(c2, uri, NULL);
 }
 
 void c2_verb_config_free(struct c2_verb_config *vc)
@@ -184,6 +191,8 @@ void c2_verb_config_free(struct c2_verb_config *vc)
 		free(vc->uuid_get);
 		free(vc->uuid_header);
 		free(vc->uuid_cookie);
+		free(vc->user_agent);
+		free(vc->custom_headers);
 		free(vc);
 	}
 }
@@ -200,6 +209,7 @@ void c2_transport_config_free(struct c2_transport_config *tc)
 		free(tc->c2_uuid);
 		c2_verb_config_free(tc->c2_get);
 		c2_verb_config_free(tc->c2_post);
+		free(tc->raw_tlv);
 		free(tc);
 	}
 }
@@ -212,13 +222,7 @@ struct c2_transport_config * c2_transport_get_config(struct c2_transport *t)
 int c2_add_transport_uri_config(struct c2 *c2, const char *uri,
 		struct c2_transport_config *config)
 {
-	int rc = c2_add_transport_uri(c2, uri);
-	if (rc == 0 && config) {
-		/* Find the last-added transport (tail of CDL) */
-		struct c2_transport *t = c2->transports->prev;
-		t->config = config;
-	}
-	return rc;
+	return c2_add_transport(c2, uri, config);
 }
 
 static struct c2_transport *
@@ -243,12 +247,12 @@ static void transport_tx(struct c2 *c2)
 int c2_transport_egress_pending(struct c2 *c2)
 {
 	struct c2_transport *t = c2->curr_transport;
+	return t && t->type->cbs.egress_pending ? t->type->cbs.egress_pending(t) : 0;
+}
 
-	if (strcmp(c2_get_proto(t), "tcp") == 0 || strcmp(c2_get_proto(t), "fd") == 0) {
-		return 0;
-	}
-
-	return http_transport_egress_pending(t);
+int c2_transport_get_socket_fd(struct c2_transport *t)
+{
+	return t && t->type->cbs.get_socket_fd ? t->type->cbs.get_socket_fd(t) : -1;
 }
 
 ssize_t c2_read(struct c2 *c2, void *buf, size_t buflen)
@@ -399,8 +403,9 @@ struct c2_transport_type * c2_get_transport_type(struct c2_transport *t)
 	return t->type;
 }
 
-char * c2_get_proto(struct c2_transport *t){
-	return t->type->proto;
+const char * c2_get_proto(struct c2_transport *t)
+{
+	return t ? t->type->proto : NULL;
 }
 
 void c2_transport_set_ctx(struct c2_transport *t, void *ctx)
